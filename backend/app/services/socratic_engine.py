@@ -37,7 +37,8 @@ class SocraticEngine:
         model_name = request.model_override or settings.PRIMARY_MODEL
 
         image_bytes = None
-        if request.image_base64:
+        has_image = bool(request.image_base64)
+        if has_image:
             try:
                 clean_b64 = request.image_base64
                 if "base64," in clean_b64:
@@ -45,8 +46,9 @@ class SocraticEngine:
                 image_bytes = base64.b64decode(clean_b64)
             except Exception as e:
                 print(f"Error decoding image: {e}")
+                has_image = False
 
-        prompt = self._build_prompt(request)
+        prompt = self._build_prompt(request, has_image=has_image)
         system_instruction = get_system_prompt_for_subject(request.subject)
 
         if client.client:
@@ -77,11 +79,15 @@ class SocraticEngine:
             f"{sanitized_guidance} {sanitized_question}"
         )
 
-        # Generate Visual Step Annotations
-        boxes = VisionAnnotator.generate_step_annotations(
-            student_work_text=request.student_work_text or request.problem_text or "",
-            error_type=parsed.get("identified_error_type")
-        )
+        # Use AI-provided bounding boxes if available (image mode), else generate heuristic ones
+        ai_boxes = parsed.get("bounding_boxes")
+        if has_image and ai_boxes and isinstance(ai_boxes, list) and len(ai_boxes) > 0:
+            boxes = self._parse_ai_bounding_boxes(ai_boxes)
+        else:
+            boxes = VisionAnnotator.generate_step_annotations(
+                student_work_text=request.student_work_text or request.problem_text or "",
+                error_type=parsed.get("identified_error_type")
+            )
 
         return SocraticResponse(
             tier=request.current_tier,
@@ -95,7 +101,24 @@ class SocraticEngine:
             model_used=model_name
         )
 
-    def _build_prompt(self, request: SocraticRequest) -> str:
+    def _parse_ai_bounding_boxes(self, raw_boxes: list) -> List[BoundingBox]:
+        """Convert AI-returned bbox dicts into validated BoundingBox objects."""
+        result = []
+        for box in raw_boxes:
+            try:
+                result.append(BoundingBox(
+                    label=str(box.get("label", "Error region")),
+                    ymin=float(max(0, min(1000, box.get("ymin", 0)))),
+                    xmin=float(max(0, min(1000, box.get("xmin", 0)))),
+                    ymax=float(max(0, min(1000, box.get("ymax", 1000)))),
+                    xmax=float(max(0, min(1000, box.get("xmax", 1000)))),
+                    status=str(box.get("status", "error"))
+                ))
+            except Exception as e:
+                print(f"Skipping invalid bbox: {box} — {e}")
+        return result if result else []
+
+    def _build_prompt(self, request: SocraticRequest, has_image: bool = False) -> str:
         hint_instructions = {
             HintTier.SMALL_HINT: (
                 "HINT LEVEL 1 — Small Hint:\n"
@@ -126,6 +149,29 @@ class SocraticEngine:
                 f"{m.role.upper()}: {m.content}" for m in request.chat_history[-4:]
             )
 
+        bbox_instructions = ""
+        bbox_format = ""
+        if has_image:
+            bbox_instructions = """
+IMPORTANT — IMAGE ANALYSIS:
+The student has uploaded a handwritten image. You MUST:
+1. Carefully examine each visible step in the image.
+2. Identify WHICH step contains the error or needs attention.
+3. Estimate the bounding box of that step in normalized coordinates (0 to 1000 scale, where 0=top-left and 1000=bottom-right of the image).
+4. Return the bounding box in the JSON output below.
+"""
+            bbox_format = """,
+  "bounding_boxes": [
+    {{
+      "label": "Step N: brief description of the error",
+      "ymin": <top edge 0-1000>,
+      "xmin": <left edge 0-1000>,
+      "ymax": <bottom edge 0-1000>,
+      "xmax": <right edge 0-1000>,
+      "status": "error"
+    }}
+  ]"""
+
         prompt = f"""
 STUDENT SUBMISSION FOR SOCRATIC REVIEW:
 Subject: {request.subject.value.upper()}
@@ -140,7 +186,7 @@ Problem Statement:
 Student's Submitted Work:
 {request.student_work_text or "See attached image/diagram for handwritten steps."}
 {chat_context}
-
+{bbox_instructions}
 Analyze the student's work step-by-step.
 Formulate guidance strictly conforming to the requested Hint Level.
 
@@ -151,10 +197,11 @@ You MUST respond with a single valid JSON object with these exact keys:
   "socratic_guidance": "Clear explanation/clue tailored to the selected hint level without leaking the answer",
   "probing_question": "A focused question prompting the student's reflection/next calculation",
   "is_correct": false,
-  "mastery_celebration": null
+  "mastery_celebration": null{bbox_format}
 }}
 """
         return prompt
+
 
     def _parse_json_response(self, text: str) -> Dict[str, Any]:
         """Safely extracts JSON from model markdown fences or plain text."""
